@@ -5,6 +5,9 @@ For each stock on each day, we compute three lagged features:
     - Daily:   sqrt(RV) from yesterday
     - Weekly:  average sqrt(RV) over the past 5 days
     - Monthly: average sqrt(RV) over the past 22 days
+
+These correspond to the standard HAR model (Corsi 2009),
+using the sqrt form (Paper 1 Eq.11, Paper 2 Eq.5).
 """
 
 import numpy as np
@@ -18,8 +21,25 @@ from gnn_vol.config import (
 
 
 def build_har_features(rv_df: pd.DataFrame) -> dict:
+    """
+    Build the HAR feature tensor from a DataFrame of sqrt(RV).
+
+    Args:
+        rv_df: DataFrame with DatetimeIndex, one column per ticker,
+               values = daily sqrt(RV). Output of RVComputer.compute_rv().
+
+    Returns:
+        dict with:
+            "V":       np.ndarray of shape (T, N, 3) — the feature tensor
+                       where the 3 channels are [daily, weekly, monthly]
+            "dates":   DatetimeIndex of length T
+            "tickers": list of ticker strings of length N
+    """
     tickers = list(rv_df.columns)
     n_stocks = len(tickers)
+
+    # Forward-fill small NaN gaps (missing bars on holidays, half-days, etc.)
+    rv_df = rv_df.ffill()
 
     # Daily: yesterday's RV
     daily = rv_df.shift(HAR_DAILY_LAG)
@@ -30,7 +50,7 @@ def build_har_features(rv_df: pd.DataFrame) -> dict:
     # Monthly: mean of days t-6 through t-22 (17 days)
     monthly = rv_df.shift(6).rolling(window=HAR_MONTHLY_LAG - 5).mean()
 
-    # Find rows where all three features are available
+    # Find rows where all three features are available (drop NaN warmup period)
     valid_mask = daily.notna().all(axis=1) & weekly.notna().all(
         axis=1) & monthly.notna().all(axis=1)
 
@@ -55,6 +75,21 @@ def build_har_features(rv_df: pd.DataFrame) -> dict:
 
 
 def build_targets(rv_df: pd.DataFrame, horizon: int, dates: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Build forecast targets aligned with HAR feature dates.
+
+    For horizon=1: target is tomorrow's sqrt(RV).
+    For horizon=5: target is the sum of sqrt(RV) over the next 5 days.
+
+    Args:
+        rv_df:   same DataFrame passed to build_har_features()
+        horizon: number of days ahead (1 or 5)
+        dates:   the dates index returned by build_har_features()
+
+    Returns:
+        np.ndarray of shape (T, N) — the target values.
+        Rows with any NaN targets are set to NaN (caller should handle).
+    """
     if horizon == 1:
         targets = rv_df.shift(-1)
     else:

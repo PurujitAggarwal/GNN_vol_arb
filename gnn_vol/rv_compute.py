@@ -1,18 +1,17 @@
-"""
-Fetch 5-minute intraday bars from Alpha Vantage and compute daily realised volatility.
-RV is defined as the sum of squared intraday log-returns.
-"""
+
+
 import time
 import requests
 import numpy as np
 import pandas as pd
 
 from gnn_vol.config import (
-    ALPHA_VANTAGE_API_KEY,
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    ALPACA_BASE_URL,
     INTRADAY_DIR,
     RV_DIR,
     INTRADAY_INTERVAL,
-    API_DELAY_SECONDS,
 )
 
 
@@ -20,82 +19,99 @@ class RVComputer:
 
     def __init__(self, tickers: list[str]):
         self.tickers = [t.upper() for t in tickers]
+        self.headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        }
         INTRADAY_DIR.mkdir(parents=True, exist_ok=True)
         RV_DIR.mkdir(parents=True, exist_ok=True)
 
-    def fetch_intraday(self, ticker: str, month: str) -> pd.DataFrame:
-        """
-        Fetch 5-min bars for one ticker for one month from Alpha Vantage.
+    def fetch_intraday(self, ticker: str, start: str, end: str) -> pd.DataFrame:
 
-        Args:
-            ticker: e.g. "AAPL"
-            month:  e.g. "2024-01"
-
-        Returns:
-            DataFrame with [open, high, low, close, volume], datetime index.
-            Empty DataFrame if the request fails.
-        """
+        all_bars = []
+        url = f"{ALPACA_BASE_URL}/stocks/{ticker}/bars"
         params = {
-            "function": "TIME_SERIES_INTRADAY",
-            "symbol": ticker,
-            "interval": INTRADAY_INTERVAL,
-            "month": month,
-            "outputsize": "full",
-            "apikey": ALPHA_VANTAGE_API_KEY,
-            "datatype": "json",
+            "timeframe": INTRADAY_INTERVAL,
+            "start": start,
+            "end": end,
+            "limit": 10000,
+            "adjustment": "split",
         }
 
-        response = requests.get(
-            "https://www.alphavantage.co/query", params=params)
-        data = response.json()
+        while True:
+            # Retry up to 3 times if connection drops
+            for attempt in range(3):
+                try:
+                    response = requests.get(
+                        url, headers=self.headers, params=params)
+                    break
+                except requests.exceptions.ConnectionError:
+                    if attempt < 2:
+                        wait = 5 * (attempt + 1)
+                        print(
+                            f"  [!] Connection error for {ticker}, retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        print(
+                            f"  [!] Failed to fetch {ticker} after 3 attempts")
+                        return pd.DataFrame()
 
-        key = f"Time Series ({INTRADAY_INTERVAL})"
-        if key not in data:
-            print(f"  [!] No data for {ticker} {month}: {list(data.keys())}")
+            if response.status_code != 200:
+                print(
+                    f"  [!] Error fetching {ticker}: {response.status_code} {response.text[:200]}")
+                break
+
+            data = response.json()
+            bars = data.get("bars", [])
+
+            if not bars:
+                break
+
+            all_bars.extend(bars)
+
+            next_token = data.get("next_page_token")
+            if next_token:
+                params["page_token"] = next_token
+                time.sleep(0.5)
+            else:
+                break
+
+        if not all_bars:
             return pd.DataFrame()
 
-        df = pd.DataFrame.from_dict(data[key], orient="index")
-        df.columns = ["open", "high", "low", "close", "volume"]
-        df = df.astype(float)
-        df.index = pd.to_datetime(df.index)
+        df = pd.DataFrame(all_bars)
+        df = df.rename(columns={"t": "timestamp", "o": "open",
+                       "h": "high", "l": "low", "c": "close", "v": "volume"})
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("timestamp")
+        df = df[["open", "high", "low", "close", "volume"]]
         df = df.sort_index()
+
         return df
 
-    def fetch_and_cache_ticker(self, ticker: str, months: list[str]) -> pd.DataFrame:
-        """
-        Fetch multiple months of intraday data for one ticker.
-        Skips months already cached on disk.
-        """
+    def fetch_and_cache_ticker(self, ticker: str, start: str, end: str) -> pd.DataFrame:
+
         ticker = ticker.upper()
-        frames = []
+        cache_path = INTRADAY_DIR / f"{ticker}.parquet"
 
-        for month in months:
-            cache_path = INTRADAY_DIR / f"{ticker}_{month}.parquet"
+        if cache_path.exists():
+            return pd.read_parquet(cache_path)
 
-            if cache_path.exists():
-                frames.append(pd.read_parquet(cache_path))
-                continue
+        print(f"  Fetching {ticker} ({start} to {end})...")
+        df = self.fetch_intraday(ticker, start, end)
 
-            print(f"  Fetching {ticker} {month}...")
-            df = self.fetch_intraday(ticker, month)
-            if df.empty:
-                continue
+        if df.empty:
+            print(f"  [!] No data for {ticker}")
+            return df
 
-            df.to_parquet(cache_path)
-            frames.append(df)
-            time.sleep(API_DELAY_SECONDS)  # respect rate limit
+        df.to_parquet(cache_path)
+        print(f"  Cached {len(df)} bars for {ticker}")
+        time.sleep(2)
 
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames).sort_index()
+        return df
 
     def _daily_rv_from_bars(self, intraday_df: pd.DataFrame) -> pd.Series:
-        """
-        Compute daily realised variance from 5-min close prices.
 
-        RV_t = sum of squared 5-min log-returns on day t.
-        Returns sqrt(RV_t) based on the papers
-        """
         closes = intraday_df["close"].copy()
         log_ret = np.log(closes / closes.shift(1))
         log_ret = log_ret.dropna()
@@ -109,21 +125,12 @@ class RVComputer:
         # Return sqrt form
         return np.sqrt(rv)
 
-    def compute_rv(self, months: list[str]) -> pd.DataFrame:
-        """
-        Compute daily sqrt(RV) for all tickers across the given months.
+    def compute_rv(self, start: str, end: str) -> pd.DataFrame:
 
-        Args:
-            months: list of months like ["2023-01", "2023-02", ...]
-
-        Returns:
-            DataFrame with DatetimeIndex, one column per ticker, values = sqrt(RV).
-            Saved to disk as Parquet.
-        """
         rv_dict = {}
 
         for ticker in self.tickers:
-            intraday = self.fetch_and_cache_ticker(ticker, months)
+            intraday = self.fetch_and_cache_ticker(ticker, start, end)
             if intraday.empty:
                 print(f"  [!] Skipping {ticker}: no intraday data")
                 continue
@@ -132,7 +139,6 @@ class RVComputer:
         rv_df = pd.DataFrame(rv_dict)
         rv_df = rv_df.sort_index()
 
-        # Save
         out_path = RV_DIR / "rv_sqrt.parquet"
         rv_df.to_parquet(out_path)
         print(
@@ -141,7 +147,7 @@ class RVComputer:
         return rv_df
 
     def load_rv(self) -> pd.DataFrame:
-        """Load previously computed RV from disk."""
+
         path = RV_DIR / "rv_sqrt.parquet"
         if not path.exists():
             raise FileNotFoundError(
@@ -149,26 +155,9 @@ class RVComputer:
         return pd.read_parquet(path)
 
 
-def generate_months(start: str, end: str) -> list[str]:
-    """
-    Generate list of month strings between two dates.
-
-    Args:
-        start: e.g. "2020-01"
-        end:   e.g. "2024-12"
-
-    Returns:
-        ["2020-01", "2020-02", ..., "2024-12"]
-    """
-    dates = pd.date_range(start=start + "-01", end=end + "-28", freq="MS")
-    return [d.strftime("%Y-%m") for d in dates]
-
-
 if __name__ == "__main__":
-    # Example: compute RV for a small test
     from gnn_vol.universe import ALL_TICKERS
 
-    months = generate_months("2024-01", "2024-03")
-    computer = RVComputer(ALL_TICKERS[:3])  # just 3 tickers as a test
-    rv = computer.compute_rv(months)
+    computer = RVComputer(ALL_TICKERS)
+    rv = computer.compute_rv(start="2016-01-01", end="2026-01-01")
     print(rv.head(10))
