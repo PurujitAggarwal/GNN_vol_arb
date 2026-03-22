@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from delta_Hedging import DeltaHedger
+from Delta_Hedging import DeltaHedger
 from hedging_transaction_costs import TransactionCostCalculator
 from transactionCosts import TransactionCost
 from implied_vol_surface import ImpliedVolSurface
@@ -70,7 +70,8 @@ class Position:
              dividend_yield, ticker, position_size, starting_capital,
              tc_calc: TransactionCost, verbose=False) -> "Position | None":
         """Returns None if the trade should be skipped (size / risk guard)."""
-        straddle_price_per_unit = atm_option['straddle_price'] * CONTRACT_MULTIPLIER
+        straddle_price_per_unit = atm_option['straddle_price'] * \
+            CONTRACT_MULTIPLIER
         num_straddles = max(1, int(position_size / straddle_price_per_unit))
         entry_credit = straddle_price_per_unit * num_straddles
 
@@ -88,7 +89,8 @@ class Position:
             ticker=ticker.upper()
         )
 
-        hedger = DeltaHedger(spot_price, risk_free_rate=RISK_FREE_RATE, dividend_yield=dividend_yield)
+        hedger = DeltaHedger(
+            spot_price, risk_free_rate=RISK_FREE_RATE, dividend_yield=dividend_yield)
         hedge_result = hedger.calculate_hedge_position(
             spot_price, atm_option['strike'], atm_option['maturity'],
             market_iv, position_sign=-1,
@@ -110,7 +112,7 @@ class Position:
               (RISK_FREE_RATE - dividend_yield + 0.5 * market_iv ** 2) * atm_option['maturity']) / \
              (market_iv * np.sqrt(atm_option['maturity']))
         straddle_gamma = np.exp(-dividend_yield * atm_option['maturity']) * norm.pdf(d1) / \
-                         (spot_price * market_iv * np.sqrt(atm_option['maturity'])) * 2
+            (spot_price * market_iv * np.sqrt(atm_option['maturity'])) * 2
 
         return cls(
             entry_date=current_date,
@@ -133,11 +135,13 @@ class Position:
         """Reprice, recalculate IV, and rebalance the delta hedge. Returns False if unable to price."""
         self.days_held = (current_date - self.entry_date).days
 
-        current_call, current_put = self._find_current_option_prices(current_date, options_by_date)
+        current_call, current_put = self._find_current_option_prices(
+            current_date, options_by_date)
         if current_call is None:
             return False
 
-        self.current_straddle_value = (current_call + current_put) * CONTRACT_MULTIPLIER * self.num_straddles
+        self.current_straddle_value = (
+            current_call + current_put) * CONTRACT_MULTIPLIER * self.num_straddles
 
         current_maturity = max(0.01, self.dte_remaining / 365)
 
@@ -147,7 +151,8 @@ class Position:
             dividend_yield=self.dividend_yield,
             verbose=False
         )
-        self.current_iv = self._get_current_iv(iv_calc, current_maturity, current_call, current_put)
+        self.current_iv = self._get_current_iv(
+            iv_calc, current_maturity, current_call, current_put)
         if self.current_iv is None:
             return False
 
@@ -185,7 +190,8 @@ class Position:
         iv_chg = self.iv_change
 
         exit_tc = tc_calc.calculate(
-            price=self.current_straddle_value / (CONTRACT_MULTIPLIER * self.num_straddles),
+            price=self.current_straddle_value /
+            (CONTRACT_MULTIPLIER * self.num_straddles),
             contracts=self.num_straddles * 2,
             ticker=ticker.upper()
         )
@@ -233,7 +239,8 @@ class Position:
         if date_options is None:
             return None, None
 
-        strike_options = date_options[date_options['strike_price'] == self.strike]
+        strike_options = date_options[date_options['strike_price']
+                                      == self.strike]
         calls = strike_options[strike_options['cp_flag'] == 'C']
         puts = strike_options[strike_options['cp_flag'] == 'P']
 
@@ -247,15 +254,18 @@ class Position:
 
     def _get_current_iv(self, iv_calc, current_maturity, call_price, put_price) -> float | None:
         try:
-            call_iv = iv_calc.implied_volatility(call_price, self.strike, current_maturity, 'call')
-            put_iv = iv_calc.implied_volatility(put_price, self.strike, current_maturity, 'put')
+            call_iv = iv_calc.implied_volatility(
+                call_price, self.strike, current_maturity, 'call')
+            put_iv = iv_calc.implied_volatility(
+                put_price, self.strike, current_maturity, 'put')
             ivs = [v for v in [call_iv, put_iv] if not np.isnan(v)]
             return float(np.mean(ivs)) if ivs else None
         except Exception:
             return None
 
     def _rebalance_hedge(self, spot_price, current_maturity):
-        hedger = DeltaHedger(spot_price, risk_free_rate=RISK_FREE_RATE, dividend_yield=self.dividend_yield)
+        hedger = DeltaHedger(
+            spot_price, risk_free_rate=RISK_FREE_RATE, dividend_yield=self.dividend_yield)
         hedge_result = hedger.calculate_hedge_position(
             spot_price, self.strike, current_maturity, self.current_iv,
             position_sign=-1, num_straddles=self.num_straddles,
@@ -282,9 +292,10 @@ class Position:
               (RISK_FREE_RATE - self.dividend_yield + 0.5 * self.current_iv ** 2) * current_maturity) / \
              (self.current_iv * np.sqrt(current_maturity))
         gamma = np.exp(-self.dividend_yield * current_maturity) * norm.pdf(d1) / \
-                (spot_price * self.current_iv * np.sqrt(current_maturity)) * 2
+            (spot_price * self.current_iv * np.sqrt(current_maturity)) * 2
 
-        gamma_pnl = -0.5 * self._prev_gamma * (spot_change ** 2) * self.num_straddles * CONTRACT_MULTIPLIER
+        gamma_pnl = -0.5 * self._prev_gamma * \
+            (spot_change ** 2) * self.num_straddles * CONTRACT_MULTIPLIER
         theta_pnl = -hedger.calculate_theta_pnl(
             self.strike, current_maturity, self.current_iv, days=1
         ) * self.num_straddles * CONTRACT_MULTIPLIER
