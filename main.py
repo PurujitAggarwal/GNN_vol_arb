@@ -1,58 +1,111 @@
 from collections import defaultdict
+import os
+import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from volForecaster import Model
 
-MAX_POSITIONS = 5 # number of positions you can hold at once
+if len(sys.argv) < 2:
+    print(f"Usage: python main.py <model>")
+    print(f"Available models: {[m.name for m in Model]}")
+    sys.exit(1)
+
+MODEL = Model[sys.argv[1].upper()]
+RESULTS_DIR = f"{MODEL.name}_results"
+
+MAX_POSITIONS = 5
+MAX_PER_SECTOR = float('inf')
 MAX_POSITION_SIZE = 0.10
 MAX_DEPLOYED = 0.40
 ONE_PER_TICKER = True
 DRAWDOWN_HALT = 0.10
 
-ALL_TICKERS = ['AAPL', 'DIS', 'MSFT', 'PFE', 'UNH', 'WMT', 'XOM']
+TICKER_SECTORS = {
+    'AAPL': 'Tech',
+    # 'AMD': 'Tech',
+    'AMZN': 'Tech',
+    'GOOG': 'Tech',
+    'MSFT': 'Tech',
+    'NVDA': 'Tech',
+    'MU': 'Semis',
+    'INTC': 'Semis',
+    'NFLX': 'Consumer',
+    'NKE': 'Consumer',
+    'SBUX': 'Consumer',
+    'DIS': 'Consumer',
+    'TSLA': 'Auto',
+    'WMT': 'Retail',
+    'XOM': 'Energy',
+    'PFE': 'Healthcare',
+    'UNH': 'Healthcare',
+    'BAC': 'Financials',
+    'GS': 'Financials',
+    'BA': 'Industrial',
+    'CAT': 'Industrial',
+    'GE': 'Industrial',
+}
+
+ALL_TICKERS = list(TICKER_SECTORS.keys())
 INITIAL_CASH = 100_000
 
 cash = INITIAL_CASH
 available_tickers = set(ALL_TICKERS)
-open_positions = defaultdict(list) # exit_date -> list[(trade_id, pnl, ticker, principal)]
+remaining_sector_counts = {
+    sector: MAX_PER_SECTOR for sector in set(TICKER_SECTORS.values())}
+open_positions = defaultdict(list)
 num_open_positions = 0
 
 results = []
-
 trade_records = {}
 next_trade_id = 1
+
 
 def can_place_trade(cost, ticker):
     deployed_capital = INITIAL_CASH - cash
     potential_deployment = (deployed_capital + cost) / INITIAL_CASH
-    
-    return num_open_positions < MAX_POSITIONS and ticker in available_tickers and potential_deployment < MAX_DEPLOYED
+    return (num_open_positions < MAX_POSITIONS
+            and ticker in available_tickers
+            and remaining_sector_counts[TICKER_SECTORS[ticker]] > 0
+            and potential_deployment < MAX_DEPLOYED)
 
 
 # open all trade logs and sort
 df = pd.DataFrame()
+missing_tickers = []
 for ticker in ALL_TICKERS:
-    data = pd.read_csv(f'results/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv')
-    data = data[['entry_date','exit_date','entry_credit','net_pnl','garch_forecast']]
+    path = f'{RESULTS_DIR}/trade_log/trade_log_{ticker.lower()}_SHORT_VOL.csv'
+    if not os.path.exists(path):
+        missing_tickers.append(ticker)
+        continue
+    data = pd.read_csv(path)
+    data = data[['entry_date', 'exit_date',
+                 'entry_credit', 'net_pnl', 'garch_forecast']]
     data['ticker'] = ticker
     df = pd.concat([df, data], ignore_index=True)
 
-df = df.sort_values(by=['entry_date', 'garch_forecast'], ascending=[True, False])
+if missing_tickers:
+    print(f"Warning: Missing trade logs for {missing_tickers}")
+print(
+    f"Loaded {len(df)} trades across {len(ALL_TICKERS) - len(missing_tickers)} tickers")
+print(f"Model: {MODEL} | Results dir: {RESULTS_DIR}")
 
-print(df.head())
+df = df.sort_values(by=['entry_date', 'garch_forecast'],
+                    ascending=[True, False])
 
 df['entry_date'] = pd.to_datetime(df['entry_date'])
 df['exit_date'] = pd.to_datetime(df['exit_date'])
-all_dates = pd.date_range(start=df['entry_date'].min(), end=max(df['entry_date'].max(), df['exit_date'].max()))
+all_dates = pd.date_range(start=df['entry_date'].min(), end=max(
+    df['entry_date'].max(), df['exit_date'].max()))
 
 for current_date in all_dates:
     # close expired positions
     for exit_date in list(open_positions.keys()):
         if exit_date <= current_date:
-            # Close trades scheduled for this (or earlier) date
             positions_to_close = open_positions[exit_date]
             while positions_to_close:
-                locked_principal_before = sum(item[3] for trades in open_positions.values() for item in trades)
+                locked_principal_before = sum(
+                    item[3] for trades in open_positions.values() for item in trades)
                 equity_before = cash + locked_principal_before
                 deployed_before = locked_principal_before
                 cash_before = cash
@@ -61,6 +114,7 @@ for current_date in all_dates:
                 cash += (principal + pnl)
                 num_open_positions -= 1
                 available_tickers.add(ticker)
+                remaining_sector_counts[TICKER_SECTORS[ticker]] += 1
 
                 locked_principal_after = locked_principal_before - principal
                 equity_after = cash + locked_principal_after
@@ -77,13 +131,13 @@ for current_date in all_dates:
                         'exit_deployed_after': deployed_after,
                     })
             del open_positions[exit_date]
-    
+
     day_entries = df[df['entry_date'] == current_date]
-    
-    # place trades
+
     for _, trade in day_entries.iterrows():
         if can_place_trade(trade['entry_credit'], trade['ticker']):
-            locked_principal_before = sum(item[3] for trades in open_positions.values() for item in trades)
+            locked_principal_before = sum(
+                item[3] for trades in open_positions.values() for item in trades)
             equity_before = cash + locked_principal_before
             deployed_before = locked_principal_before
             cash_before = cash
@@ -102,7 +156,10 @@ for current_date in all_dates:
             if ONE_PER_TICKER:
                 available_tickers.remove(trade['ticker'])
 
-            locked_principal_after = sum(item[3] for trades in open_positions.values() for item in trades)
+            remaining_sector_counts[TICKER_SECTORS[trade['ticker']]] -= 1
+
+            locked_principal_after = sum(
+                item[3] for trades in open_positions.values() for item in trades)
             equity_after = cash + locked_principal_after
             deployed_after = locked_principal_after
 
@@ -120,38 +177,17 @@ for current_date in all_dates:
                 'entry_equity_after': equity_after,
                 'entry_deployed_before': deployed_before,
                 'entry_deployed_after': deployed_after,
-                'exit_date_actual': pd.NaT,
-                'exit_cash_before': np.nan,
-                'exit_cash_after': np.nan,
-                'exit_equity_before': np.nan,
-                'exit_equity_after': np.nan,
-                'exit_deployed_before': np.nan,
-                'exit_deployed_after': np.nan,
             }
-            
-            print(f"Trade: {current_date.date()}, {trade['ticker']} | Cash: {cash:.2f}")
-    
-    locked_principal = sum(item[3] for trades in open_positions.values() for item in trades)
+
+            print(
+                f"Trade: {current_date.date()}, {trade['ticker']} | Cash: {cash:.2f}")
+
+    locked_principal = sum(
+        item[3] for trades in open_positions.values() for item in trades)
     current_total_equity = cash + locked_principal
     deployed_capital = locked_principal
-    
+
     results.append((current_date, current_total_equity, deployed_capital))
-    # print(f"Date: {current_date} | Equity: {current_total_equity:.2f} | Free Cash: {cash:.2f}")
-
-# plot results
-dates = [r[0] for r in results]
-cash_values = [r[1] for r in results]
-deployed_values = [r[2] for r in results]
-
-plt.figure(figsize=(12, 6))
-plt.plot(dates, cash_values, linewidth=2)
-plt.xlabel('Date')
-plt.ylabel('Cash')
-plt.title('Cash Over Time')
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
-
 
 res_df = pd.DataFrame(results, columns=['date', 'equity', 'deployed_capital'])
 res_df['date'] = pd.to_datetime(res_df['date'])
@@ -163,9 +199,11 @@ total_return = (res_df['equity'].iloc[-1] / INITIAL_CASH) - 1
 days_total = (res_df.index[-1] - res_df.index[0]).days
 annualized_return = (1 + total_return) ** (365 / days_total) - 1
 annual_vol = res_df['daily_ret'].std() * np.sqrt(252)
-sharpe_ratio = (res_df['daily_ret'].mean() / res_df['daily_ret'].std()) * np.sqrt(252) if res_df['daily_ret'].std() != 0 else 0
+sharpe_ratio = (res_df['daily_ret'].mean() / res_df['daily_ret'].std()
+                ) * np.sqrt(252) if res_df['daily_ret'].std() != 0 else 0
 downside_rets = res_df['daily_ret'][res_df['daily_ret'] < 0]
-sortino_ratio = (res_df['daily_ret'].mean() / downside_rets.std()) * np.sqrt(252) if len(downside_rets) > 0 else 0
+sortino_ratio = (res_df['daily_ret'].mean() / downside_rets.std()
+                 ) * np.sqrt(252) if len(downside_rets) > 0 else 0
 
 res_df['peak'] = res_df['equity'].cummax()
 res_df['drawdown'] = (res_df['equity'] - res_df['peak']) / res_df['peak']
@@ -174,9 +212,9 @@ worst_one_day_drawdown = res_df['daily_ret'].min()
 average_margin_usage = res_df['margin_usage'].mean()
 peak_margin_usage = res_df['margin_usage'].max()
 
-print("\n" + "="*30)
-print("STRATEGY PERFORMANCE")
-print("="*30)
+print("\n" + "=" * 50)
+print(f"  {MODEL} STRATEGY PERFORMANCE")
+print("=" * 50)
 print(f"Total Return:         {total_return:.2%}")
 print(f"Annualized Return:    {annualized_return:.2%}")
 print(f"Max Drawdown:         {max_drawdown:.2%}")
@@ -187,6 +225,27 @@ print(f"Average Margin Usage: {average_margin_usage:.2%}")
 print(f"Peak Margin Usage:    {peak_margin_usage:.2%}")
 print(f"Total Trades:         {len(df)}")
 
+# Per-ticker summary
+print("\n" + "=" * 60)
+print(f"  PER-TICKER PERFORMANCE ({MODEL})")
+print("=" * 60)
+print(f"{'Ticker':<8} {'Sector':<12} {'Trades':>7} {'Net P&L':>12} {'Win Rate':>10} {'Avg P&L':>10}")
+print("-" * 60)
+for ticker in sorted(ALL_TICKERS):
+    t_df = df[df['ticker'] == ticker]
+    if len(t_df) == 0:
+        continue
+    net = t_df['net_pnl'].sum()
+    wr = (t_df['net_pnl'] > 0).mean() * 100
+    avg = t_df['net_pnl'].mean()
+    sector = TICKER_SECTORS.get(ticker, '?')
+    print(f"{ticker:<8} {sector:<12} {len(t_df):>7} ${net:>10,.2f} {wr:>9.1f}% ${avg:>9,.2f}")
+print("-" * 60)
+total_net = df['net_pnl'].sum()
+total_wr = (df['net_pnl'] > 0).mean() * 100
+total_avg = df['net_pnl'].mean()
+print(f"{'TOTAL':<8} {'':12} {len(df):>7} ${total_net:>10,.2f} {total_wr:>9.1f}% ${total_avg:>9,.2f}")
+
 # plot graphs
 fig = plt.figure(figsize=(16, 10))
 gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
@@ -195,35 +254,39 @@ equity_color = '#2E86AB'
 deployed_color = '#A23B72'
 drawdown_color = '#F18F01'
 
-# Equity Curve
 ax1 = fig.add_subplot(gs[0, :])
-ax1.plot(res_df.index, res_df['equity'], linewidth=2.5, color=equity_color, label='Portfolio Equity')
-ax1.axhline(y=INITIAL_CASH, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='Initial Capital')
-ax1.fill_between(res_df.index, INITIAL_CASH, res_df['equity'], where=(res_df['equity'] >= INITIAL_CASH), 
+ax1.plot(res_df.index, res_df['equity'], linewidth=2.5,
+         color=equity_color, label='Portfolio Equity')
+ax1.axhline(y=INITIAL_CASH, color='gray', linestyle='--',
+            linewidth=1, alpha=0.5, label='Initial Capital')
+ax1.fill_between(res_df.index, INITIAL_CASH, res_df['equity'], where=(res_df['equity'] >= INITIAL_CASH),
                  alpha=0.2, color='green', interpolate=True)
-ax1.fill_between(res_df.index, INITIAL_CASH, res_df['equity'], where=(res_df['equity'] < INITIAL_CASH), 
+ax1.fill_between(res_df.index, INITIAL_CASH, res_df['equity'], where=(res_df['equity'] < INITIAL_CASH),
                  alpha=0.2, color='red', interpolate=True)
 ax1.set_ylabel('Portfolio Value ($)', fontsize=11, fontweight='bold')
-ax1.set_title('Volatility Arbitrage Strategy - Portfolio Performance', fontsize=14, fontweight='bold', pad=20)
+ax1.set_title(f'{MODEL} Volatility Arbitrage Strategy - Portfolio Performance',
+              fontsize=14, fontweight='bold', pad=20)
 ax1.grid(True, alpha=0.3, linestyle='--')
 ax1.legend(loc='upper left', framealpha=0.9)
 ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
 
-# Drawdown Chart
 ax2 = fig.add_subplot(gs[1, 0])
-ax2.fill_between(res_df.index, 0, res_df['drawdown'] * 100, color=drawdown_color, alpha=0.6)
-ax2.plot(res_df.index, res_df['drawdown'] * 100, linewidth=1.5, color=drawdown_color)
+ax2.fill_between(
+    res_df.index, 0, res_df['drawdown'] * 100, color=drawdown_color, alpha=0.6)
+ax2.plot(res_df.index, res_df['drawdown'] * 100,
+         linewidth=1.5, color=drawdown_color)
 ax2.set_ylabel('Drawdown (%)', fontsize=11, fontweight='bold')
 ax2.set_xlabel('Date', fontsize=10)
 ax2.set_title('Portfolio Drawdown', fontsize=12, fontweight='bold')
 ax2.grid(True, alpha=0.3, linestyle='--')
 ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
 
-# Deployed Capital
 ax3 = fig.add_subplot(gs[1, 1])
-ax3.plot(res_df.index, res_df['deployed_capital'], linewidth=2, color=deployed_color, label='Deployed Capital')
-ax3.fill_between(res_df.index, 0, res_df['deployed_capital'], alpha=0.3, color=deployed_color)
-ax3.axhline(y=MAX_DEPLOYED * INITIAL_CASH, color='red', linestyle='--', linewidth=1.5, 
+ax3.plot(res_df.index, res_df['deployed_capital'],
+         linewidth=2, color=deployed_color, label='Deployed Capital')
+ax3.fill_between(
+    res_df.index, 0, res_df['deployed_capital'], alpha=0.3, color=deployed_color)
+ax3.axhline(y=MAX_DEPLOYED * INITIAL_CASH, color='red', linestyle='--', linewidth=1.5,
             alpha=0.7, label=f'Max Deployment ({MAX_DEPLOYED:.0%})')
 ax3.set_ylabel('Deployed Capital ($)', fontsize=11, fontweight='bold')
 ax3.set_xlabel('Date', fontsize=10)
@@ -232,11 +295,9 @@ ax3.grid(True, alpha=0.3, linestyle='--')
 ax3.legend(loc='upper left', framealpha=0.9)
 ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
 
-# Statistics Box
 ax4 = fig.add_subplot(gs[2, :])
 ax4.axis('off')
 
-# statistics text
 stats_text = f"""
 PERFORMANCE METRICS                                    RISK METRICS                                         EXECUTION METRICS
 
@@ -256,15 +317,22 @@ for ax in [ax1, ax2, ax3]:
     for label in ax.get_xticklabels():
         label.set_ha('right')
 
-plt.suptitle(f'Strategy: {" + ".join(ALL_TICKERS)} | Initial Capital: ${INITIAL_CASH:,}', 
+plt.suptitle(f'{MODEL} Strategy: {len(ALL_TICKERS)} Tickers | Initial Capital: ${INITIAL_CASH:,}',
              fontsize=11, y=0.995, alpha=0.7)
 
-plt.show()
-
+os.makedirs(f"{RESULTS_DIR}/portfolio", exist_ok=True)
+fig.savefig(f"{RESULTS_DIR}/portfolio/strategy_performance.png",
+            dpi=300, bbox_inches='tight')
+print(
+    f"\nPortfolio chart saved to {RESULTS_DIR}/portfolio/strategy_performance.png")
+plt.close()
 
 # Save trades
 full_trade_log_df = pd.DataFrame(trade_records.values())
 if not full_trade_log_df.empty:
-    full_trade_log_df = full_trade_log_df.sort_values(['entry_date', 'garch_forecast'], ascending=[True, False])
-full_trade_log_df.to_csv('full_trade_log.csv', index=False)
-print(f"\nSaved executed trade log: full_trade_log.csv ({len(full_trade_log_df):,} trades)")
+    full_trade_log_df = full_trade_log_df.sort_values(
+        ['entry_date', 'garch_forecast'], ascending=[True, False])
+full_trade_log_df.to_csv(
+    f"{RESULTS_DIR}/portfolio/full_trade_log.csv", index=False)
+print(
+    f"Saved executed trade log: {RESULTS_DIR}/portfolio/full_trade_log.csv ({len(full_trade_log_df):,} trades)")
