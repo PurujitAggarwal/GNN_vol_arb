@@ -1,19 +1,80 @@
+import os
 import numpy as np
 import pandas as pd
+import pickle
+import torch
 from garch import garch_modelling
 from preprocess_data import parse_data
+from enum import Enum
+
+try:
+    from harcnn_train import train_harcnn, CNN_HAR_KS
+    from harcnn_ridge import forecast_next_rv, fit_ridge_for_ticker
+    _HARCNN_AVAILABLE = True
+except ImportError:
+    _HARCNN_AVAILABLE = False
 
 DE_MEAN = "AR"
 MODEL = "EGARCH"
 DISTRIBUTION = {"GARCH": "normal", "EGARCH": "t"}[MODEL]
 
 
-class VolForecaster:
+class Model(Enum):
+    EGARCH = (126, 21)
+    HARCNN = (252, 63)
+    GNN = (504, 21)
+    DS3M = (126, 21)
 
-    def __init__(self, stock_data: pd.DataFrame, train_window: int = 126, refit_frequency: int = 21, verbose=False):
-        self.stock_data = stock_data
+    def __init__(self, train_window, refit_frequency):
         self.train_window = train_window
         self.refit_frequency = refit_frequency
+
+    def __str__(self):
+        labels = {
+            Model.EGARCH: "EGARCH",
+            Model.HARCNN: "HARCNN",
+            Model.GNN: "GNNHAR",
+            Model.DS3M: "DS3M",
+        }
+        return labels[self]
+
+
+class VolForecaster:
+
+    def __init__(self, stock_data: pd.DataFrame, ticker: str = None, model: Model = Model.EGARCH, verbose=False):
+        self.stock_data = stock_data
+        self.ticker = ticker
+        self.model = model
+        self.train_window = model.train_window
+        self.refit_frequency = model.refit_frequency
+
+        if self.model == Model.HARCNN:
+            if not _HARCNN_AVAILABLE:
+                raise ImportError(
+                    "HARCNN modules not available. Install harcnn_train and harcnn_ridge.")
+            if not (os.path.exists("cnn_har_ks_weights.pth") and os.path.exists("cnn_image_scaler.pkl")):
+                train_harcnn()
+            self._cnn_model = CNN_HAR_KS(dropout=0.5).to(
+                torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            self._cnn_model.load_state_dict(torch.load(
+                "cnn_har_ks_weights.pth", map_location="cpu"))
+            with open("cnn_image_scaler.pkl", "rb") as f:
+                self._img_scaler = pickle.load(f)
+            self._ridge_bundle = fit_ridge_for_ticker(
+                ticker, self._cnn_model, self._img_scaler)
+
+        if self.model == Model.GNN:
+            from gnn_vol.universe import ALL_TICKERS, FORECAST_TICKERS
+            from gnn_vol.rv_compute import RVComputer
+            from gnn_vol.gnn_forecaster import GNNForecaster
+
+            rv_computer = RVComputer(ALL_TICKERS)
+            self._gnn_forecaster = GNNForecaster(
+                rv_computer=rv_computer,
+                all_tickers=ALL_TICKERS,
+                forecast_tickers=FORECAST_TICKERS,
+                verbose=verbose,
+            )
 
         self._last_fit_date: pd.Timestamp | None = None
         self._cached_forecast: float | None = None
@@ -21,7 +82,7 @@ class VolForecaster:
         # Rolling history for risk premium calibration
         self._forecast_history: list[float] = []
         self._market_iv_history: list[float] = []
-        
+
         self.verbose = verbose
 
     def get_forecast(self, current_date: pd.Timestamp) -> float | None:
@@ -31,6 +92,16 @@ class VolForecaster:
                 return None
 
         return self._cached_forecast
+
+    def _refit(self, current_date):
+        if self.model == Model.EGARCH:
+            return self._refit_egarch(current_date)
+        elif self.model == Model.HARCNN:
+            return self._refit_harcnn(current_date)
+        elif self.model == Model.GNN:
+            return self._refit_gnn(current_date)
+        elif self.model == Model.DS3M:
+            return self._refit_ds3m(current_date)
 
     def record_market_iv(self, market_iv: float) -> None:
         if self._cached_forecast is not None:
@@ -62,7 +133,8 @@ class VolForecaster:
         days_since = (current_date - self._last_fit_date).days
         return days_since >= self.refit_frequency
 
-    def _refit(self, current_date: pd.Timestamp) -> bool:
+    def _refit_egarch(self, current_date: pd.Timestamp) -> bool:
+        print(f"Refitting EGARCH: {current_date}")
         historical_data = (
             self.stock_data.loc[:current_date]
             .iloc[-(self.train_window + 1):-1]
@@ -82,18 +154,62 @@ class VolForecaster:
             return False
 
     def _ensemble_forecast(self, returns: pd.Series, base_forecast: float) -> float:
-        # Median of GARCH, 21-day realised vol, and 30-day EWMA vol
-        # will be replaced by new modules
-        
         forecasts = [base_forecast]
 
         if len(returns) >= 21:
             forecasts.append(returns.tail(21).std() * np.sqrt(252))
 
         if len(returns) >= 30:
-            forecasts.append(returns.ewm(span=30).std().iloc[-1] * np.sqrt(252))
+            forecasts.append(returns.ewm(
+                span=30).std().iloc[-1] * np.sqrt(252))
 
         return float(np.median(forecasts))
+
+    def _refit_harcnn(self, current_date: pd.Timestamp) -> bool:
+        print(f"Refitting HARCNN: {current_date}")
+
+        historical_data = (
+            self.stock_data.loc[:current_date]
+            .iloc[-(self.train_window + 1):-1]
+        )
+        try:
+            rv_forecast = forecast_next_rv(
+                historical_data, self._cnn_model, self._img_scaler, self._ridge_bundle
+            )
+            risk_premium = self._vol_risk_premium()
+            self._cached_forecast = np.sqrt(rv_forecast * 252) + risk_premium
+            self._last_fit_date = current_date
+            return True
+        except Exception:
+            return False
+
+    def _refit_gnn(self, current_date: pd.Timestamp) -> bool:
+        """Refit the GNN-HAR forecaster and cache the annualised vol forecast."""
+        if self.verbose:
+            print(f"Refitting GNNHAR: {current_date}")
+
+        if self.ticker is None:
+            return False
+
+        try:
+            forecast = self._gnn_forecaster.get_forecast_single(
+                pd.Timestamp(current_date), self.ticker.upper(), horizon=5
+            )
+
+            if forecast is None:
+                return False
+
+            risk_premium = self._vol_risk_premium()
+            self._cached_forecast = forecast + risk_premium
+            self._last_fit_date = current_date
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"  [!] GNN refit failed: {e}")
+            return False
+
+    def _refit_ds3m(self, current_date: pd.Timestamp) -> bool:
+        return True
 
     def _vol_risk_premium(self, min_samples: int = 60) -> float:
         if len(self._forecast_history) < min_samples:

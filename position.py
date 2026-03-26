@@ -9,6 +9,8 @@ from implied_vol_surface import ImpliedVolSurface
 RISK_FREE_RATE = 0.02
 CONTRACT_MULTIPLIER = 100
 STOP_LOSS_MULTIPLIER = 2.0
+# Hard dollar cap: close if unrealised loss exceeds this
+MAX_LOSS_PER_TRADE = 1500
 IV_SPIKE_THRESHOLD = 0.04
 IV_DROP_THRESHOLD = -0.03
 IV_CHECK_AFTER_DAYS = 3
@@ -169,6 +171,11 @@ class Position:
 
         if earnings_blocker and earnings_blocker.should_force_exit(current_date):
             return True, earnings_blocker.get_block_reason()
+
+        # Hard dollar loss cap — prevents catastrophic single-trade losses
+        total_unrealised = option_pnl + self._cumulative_hedge_pnl
+        if total_unrealised < -MAX_LOSS_PER_TRADE:
+            return True, f"Day {self.days_held} max loss cap (${total_unrealised:.0f})"
 
         if option_pnl < -STOP_LOSS_MULTIPLIER * self.entry_credit:
             return True, f"Position stop loss (2x premium): P&L ${option_pnl:.0f}"
